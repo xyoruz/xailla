@@ -2,135 +2,167 @@
 
 BASE_URL="https://my.xl.co.id"
 FC_CODE="3c71892a-852c-4a0f-8cb5-9cf731e26508"
-TOKEN_FILE="$HOME/.xl_token"
+OAID="test-device-id"
 
-# Fungsi login
-function login() {
-  echo "Masukkan nomor XL (contoh: 0812xxxxxxx):"
-  read MSISDN
+TOKEN_FILE="xl_token.txt"
 
-  echo "Mengirim OTP ke $MSISDN..."
-  curl -s -X POST "$BASE_URL/preauth/otp/request" \
+# Fungsi kirim OTP dengan header mirip aplikasi XL
+function request_otp() {
+  local msisdn="$1"
+  RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/preauth/otp/request" \
+    -H "User-Agent: okhttp/3.14.7" \
+    -H "Accept: application/json" \
     -H "Content-Type: application/json" \
-    -d "{\"msisdn\":\"$MSISDN\"}"
+    -H "Origin: https://my.xl.co.id" \
+    -H "Referer: https://my.xl.co.id/" \
+    -d "{\"msisdn\":\"$msisdn\"}")
+  HTTP=$(echo "$RESP" | tail -n1)
+  BODY=$(echo "$RESP" | sed '$d')
+  echo "$HTTP|$BODY"
+}
 
-  echo "Masukkan OTP yang diterima:"
-  read OTP
-
-  TOKEN=$(curl -s -X POST "$BASE_URL/preauth/login" \
+# Login setelah OTP benar
+function do_login() {
+  local msisdn="$1"
+  local otp="$2"
+  RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/login/otp" \
+    -H "User-Agent: okhttp/3.14.7" \
+    -H "Accept: application/json" \
     -H "Content-Type: application/json" \
-    -d "{\"msisdn\":\"$MSISDN\",\"otp\":\"$OTP\"}" | jq -r '.token')
+    -H "Origin: https://my.xl.co.id" \
+    -H "Referer: https://my.xl.co.id/" \
+    -d "{\"msisdn\":\"$msisdn\", \"otp\":\"$otp\"}")
+  HTTP=$(echo "$RESP" | tail -n1)
+  BODY=$(echo "$RESP" | sed '$d')
+  echo "$HTTP|$BODY"
+}
 
-  if [ "$TOKEN" != "null" ]; then
-    echo "$TOKEN" > "$TOKEN_FILE"
-    echo "Login berhasil!"
+# Simpan token login
+function save_token() {
+  echo "$1" > "$TOKEN_FILE"
+}
+
+function load_token() {
+  if [ -f "$TOKEN_FILE" ]; then
+    cat "$TOKEN_FILE"
   else
-    echo "Login gagal, coba lagi."
-    exit 1
+    echo ""
   fi
 }
 
-# Fungsi menampilkan informasi produk
-function info_produk() {
-  if [ ! -f "$TOKEN_FILE" ]; then
-    echo "Anda belum login, login terlebih dahulu."
-    login
-  fi
+# Cek kuota
+function check_quota() {
+  local token="$1"
+  CURL_RESP=$(curl -s -X GET "$BASE_URL/api/v1.0/account/balance-quota" \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/json")
 
-  TOKEN=$(cat "$TOKEN_FILE")
-  echo "Mengambil informasi produk FC..."
+  echo "Paket & Kuota saat ini:"
+  echo "$CURL_RESP" | jq '.balanceQuota[] | {name, quota, unit}'
+}
 
-  RESP=$(curl -s -X GET "$BASE_URL/purchase/detail/$FC_CODE" \
-    -H "Authorization: Bearer $TOKEN")
+# Beli paket via FC Code
+function purchase_package() {
+  local token="$1"
+  RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/v1.0/package/prices" \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/json" \
+    -H "Content-Type: application/json" \
+    -d "{\"productCode\": \"$FC_CODE\", \"paymentMethod\": \"pulsa\"}")
+  HTTP=$(echo "$RESP" | tail -n1)
+  BODY=$(echo "$RESP" | sed '$d')
 
-  PRODUCT=$(echo "$RESP" | jq -r '.productName')
-  PRICE=$(echo "$RESP" | jq -r '.price')
-  VALID=$(echo "$RESP" | jq -r '.validity')
-
-  if [ "$PRODUCT" != "null" ]; then
-    echo "=== Detail Produk ==="
-    echo "Nama   : $PRODUCT"
-    echo "Harga  : Rp $PRICE"
-    echo "Masa Aktif : $VALID"
+  if [ "$HTTP" -eq 200 ]; then
+    echo "Pembelian berhasil!"
+    echo "$BODY" | jq
   else
-    echo "Gagal mengambil info produk."
+    echo "Gagal membeli paket."
+    echo "$HTTP: $BODY"
   fi
 }
 
-# Fungsi pembelian
+# Menu utama
+function main_menu() {
+  echo "=============================="
+  echo " XL CLI - Menu Utama"
+  echo "=============================="
+  echo "1. Beli Paket Pros Champion (FC: $FC_CODE)"
+  echo "2. Cek Kuota"
+  echo "3. Keluar"
+  echo -n "Pilih opsi: "
+  read opsi
+
+  case $opsi in
+    1)
+      beli_paket
+      ;;
+    2)
+      cek_kuota
+      ;;
+    3)
+      exit 0
+      ;;
+    *)
+      echo "Pilihan tidak valid!"
+      ;;
+  esac
+
+  echo ""
+  main_menu
+}
+
+# Proses login dan pembelian
 function beli_paket() {
-  if [ ! -f "$TOKEN_FILE" ]; then
+  local token=$(load_token)
+
+  if [ -z "$token" ]; then
     echo "Anda belum login, login terlebih dahulu."
-    login
+    echo -n "Masukkan nomor XL (contoh: 0812xxxxxxx): "
+    read msisdn
+
+    echo "Mengirim OTP ke $msisdn..."
+    RESP=$(request_otp "$msisdn")
+
+    CODE=$(echo "$RESP" | cut -d"|" -f1)
+    BODY=$(echo "$RESP" | cut -d"|" -f2)
+
+    if [ "$CODE" -ne 200 ]; then
+      echo "Gagal mengirim OTP. Status: $CODE"
+      echo "$BODY"
+      return
+    fi
+
+    echo -n "Masukkan OTP yang diterima: "
+    read otp
+
+    LOGIN_RESP=$(do_login "$msisdn" "$otp")
+    LOGIN_CODE=$(echo "$LOGIN_RESP" | cut -d"|" -f1)
+    LOGIN_BODY=$(echo "$LOGIN_RESP" | cut -d"|" -f2)
+
+    if [ "$LOGIN_CODE" -ne 200 ]; then
+      echo "Login gagal. Status: $LOGIN_CODE"
+      echo "$LOGIN_BODY"
+      return
+    fi
+
+    token=$(echo "$LOGIN_BODY" | jq -r '.access_token')
+    save_token "$token"
   fi
 
-  TOKEN=$(cat "$TOKEN_FILE")
-  echo "Pilih metode pembayaran:"
-  echo "1. DANA"
-  echo "2. Pulsa"
-  read -p "Metode [1/2]: " METHOD
-
-  if [ "$METHOD" == "1" ]; then
-    PAYMENT_METHOD="EWALLET_DANA"
-  elif [ "$METHOD" == "2" ]; then
-    PAYMENT_METHOD="BALANCE"
-  else
-    echo "Metode pembayaran tidak valid."
-    exit 1
-  fi
-
-  echo "Memproses pembelian..."
-
-  RESP=$(curl -s -X POST "$BASE_URL/purchase/with-fc" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"fc\":\"$FC_CODE\",\"paymentMethod\":\"$PAYMENT_METHOD\"}")
-
-  echo "Respons server:"
-  echo "$RESP"
+  purchase_package "$token"
 }
 
-# Fungsi cek kuota
+# Cek kuota
 function cek_kuota() {
-  if [ ! -f "$TOKEN_FILE" ]; then
+  local token=$(load_token)
+
+  if [ -z "$token" ]; then
     echo "Anda belum login, login terlebih dahulu."
-    login
+    return
   fi
 
-  TOKEN=$(cat "$TOKEN_FILE")
-  echo "Mengambil informasi kuota..."
-
-  RESP=$(curl -s -X GET "$BASE_URL/dashboard" \
-    -H "Authorization: Bearer $TOKEN")
-
-  echo "Informasi paket/kuota:"
-  echo "$RESP" | jq
+  check_quota "$token"
 }
 
-# Menu
-echo "=== Menu Pembelian Paket XL ==="
-echo "1. Lihat Info & Harga Paket Pro Champion"
-echo "2. Beli Paket (Pilih metode pembayaran)"
-echo "3. Cek Kuota"
-echo "4. Keluar"
-echo "Pilih opsi [1/2/3/4]:"
-read PILIHAN
-
-case $PILIHAN in
-  1)
-    info_produk
-    ;;
-  2)
-    beli_paket
-    ;;
-  3)
-    cek_kuota
-    ;;
-  4)
-    echo "Keluar..."
-    exit
-    ;;
-  *)
-    echo "Pilihan tidak valid"
-    ;;
-esac
+# Start aplikasi
+main_menu
